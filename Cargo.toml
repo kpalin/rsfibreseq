@@ -1,0 +1,19 @@
+[package]
+name = "rsfibreseq"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.4.18", features = ["derive"] }
+eyre = "0.6.12"
+noodles-cram = "0.53.1"
+noodles-fasta = "0.32.0"
+noodles-sam = "0.51.0"
+noodles-util = { version = "0.34.1", features = ["alignment"] }
+thiserror = "1.0.56"
+##noodles-util = "0.34.1"
+#noodles = { version = "0.62.1", features = ["bam","cram","sam","util"] }
+
+
