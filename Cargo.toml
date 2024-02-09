@@ -17,3 +17,6 @@ thiserror = "1.0.56"
 #noodles = { version = "0.62.1", features = ["bam","cram","sam","util"] }
 
 
+[features]
+debug_dinucleotides = []
+default = []

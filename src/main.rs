@@ -1,4 +1,4 @@
-use std::error::Error;
+
 
 use eyre::Result;
 use rsfibreseq::App;
