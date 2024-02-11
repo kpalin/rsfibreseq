@@ -1,5 +1,7 @@
 use clap::Parser;
 
+use clap::Subcommand;
+use eyre::OptionExt;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -10,22 +12,30 @@ pub enum FibreSeqError {
 use eyre::Result;
 use noodles_sam::alignment::record::data::field::{tag::Tag, value::Array, Value};
 use std::cell::OnceCell;
+use std::f32::consts::E;
 use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    #[command(about = "Check the MM, ML and sequence lengths in input bam")]
+    Check(Args),
+}
+#[derive(Debug, clap::Args)]
 struct Args {
-    #[arg(long, help = "Sets the low value", default_value = "10")]
+    #[arg(short, long, default_value = "32", help = "Low cutoff for methylation")]
     low: u8,
-
-    #[arg(long, help = "Sets the high value", default_value = "120")]
+    #[arg(long, default_value = "224", help = "High cutoff for methylation")]
     high: u8,
-
-    #[arg(long, help = "Reference fasta file", default_value = "reference.fa")]
-    fasta_ref: PathBuf,
-
-    #[arg(long, help = "Number of reads to print out", default_value = "5")]
+    #[arg(long, default_value = "10", help = "Number of reads to process")]
     n_reads: usize,
-
+    #[arg(short, long, help = "Sets the reference fasta file")]
+    fasta_ref: Option<PathBuf>,
     #[arg(value_name = "INPUT", help = "Sets the input file")]
     input: PathBuf,
 }
@@ -35,7 +45,7 @@ pub struct App {
     high_cutoff: u8,
     n_reads: usize,
     input_file: PathBuf,
-    fasta_ref: PathBuf,
+    fasta_ref: Option<PathBuf>,
     //bam_reader: bam::io::Reader<bam::io::Reader<File>>,
 }
 
@@ -255,9 +265,7 @@ impl<'a> ModData {
 }
 
 impl App {
-    pub fn new() -> Self {
-        let args = Args::parse();
-        dbg!(&args);
+    fn new(args: Args) -> Self {
         Self {
             low_cutoff: args.low,
             high_cutoff: args.high,
@@ -266,15 +274,29 @@ impl App {
             n_reads: args.n_reads,
         }
     }
-    pub fn run(self) -> Result<()> {
-        let repository = fasta::indexed_reader::Builder::default()
-            .build_from_path(&self.fasta_ref)
-            .map(IndexedReader::new)
-            .map(fasta::Repository::new)?;
-
-        let mut reader = alignment::io::reader::Builder::default()
-            .set_reference_sequence_repository(repository)
-            .build_from_path(&self.input_file)?;
+    pub fn run() -> Result<()> {
+        let cmd = Cli::parse();
+        match cmd.command {
+            Some(Commands::Check(args)) => {
+                let app = App::new(args);
+                app.check_mods()?
+            }
+            None => {
+                println!("No subcommand found");
+            }
+        };
+        Ok(())
+    }
+    pub fn check_mods(self) -> Result<()> {
+        let mut builder = alignment::io::reader::Builder::default();
+        if let Some(fasta_ref) = &self.fasta_ref {
+            let repository = fasta::indexed_reader::Builder::default()
+                .build_from_path(fasta_ref)
+                .map(IndexedReader::new)
+                .map(fasta::Repository::new)?;
+            builder = builder.set_reference_sequence_repository(repository);
+        };
+        let mut reader = builder.build_from_path(&self.input_file)?;
 
         eprintln!("Opened file: {:?}", &self.input_file);
 
@@ -292,7 +314,7 @@ impl App {
             })
             .take(self.n_reads)
             .filter_map(|r| match r {
-                Ok(record) => Some(self.process_record(record).unwrap()),
+                Ok(record) => self.process_record(record).ok(),
                 _ => None,
             })
             .collect();
@@ -317,6 +339,18 @@ impl App {
                 return Err(eyre::eyre!("Error reading record"));
             }
         };
+        dbg!(&qname);
+        const DUPLEX_TAG: Tag = Tag::new(b'd', b'x');
+        let rec_data = record.data();
+        match rec_data.get(&DUPLEX_TAG) {
+            Some(Ok(Value::Int32(value))) => {
+                println!("Found duplex tag: {:?}", value);
+            }
+            _ => {
+                println!("No duplex tag found");
+            }
+        };
+
         // record.data().iter().for_each(|r| match &r {
         //     Ok((tag_id, tag_value)) => {
         //         println!("Found {:?} tag: {:?}", tag_id, tag_value);
@@ -326,8 +360,8 @@ impl App {
         //     }
         // });
         let mod_data = match (
-            record.data().get(&Tag::BASE_MODIFICATIONS),
-            record.data().get(&Tag::BASE_MODIFICATION_PROBABILITIES),
+            rec_data.get(&Tag::BASE_MODIFICATIONS),
+            rec_data.get(&Tag::BASE_MODIFICATION_PROBABILITIES),
         ) {
             (Some(Ok(Value::String(mm))), Some(Ok(Value::Array(ml)))) => {
                 let values = ModData::new(
@@ -338,10 +372,10 @@ impl App {
                 );
                 Some(values)
             }
-            (_, _) => None,
+            (_, _) => return Err(eyre::eyre!("Error reading record")),
         };
 
-        let mod_data = mod_data.unwrap()?;
+        let mod_data = mod_data.ok_or_eyre("No ML and MM tags found")??;
 
         let mean_meth = &mod_data.mean_methylation(&self.low_cutoff, &self.high_cutoff);
         print!("{:} {:?}: ", qname.unwrap(), record.flags().unwrap());
