@@ -84,6 +84,7 @@ impl App {
     }
     pub fn run() -> Result<()> {
         let cmd = Cli::parse();
+        dbg!(&cmd);
         match cmd.command {
             Some(Commands::Check(args)) => {
                 let app = App::new(args);
@@ -159,14 +160,15 @@ impl App {
 
         let mean_meth = &mod_data.mean_methylation(&self.low_cutoff, &self.high_cutoff);
         print!("{:} {:?}: ", qname.unwrap(), record.flags().unwrap());
-        let _ = &mod_data
-            .mod_types
-            .iter()
-            .zip(mean_meth.iter())
-            .for_each(|x| {
-                print!("\t{:} = {:}", String::from_utf8(x.0.clone()).unwrap(), x.1);
-            });
-
+        let _ =
+            &mod_data
+                .mod_types
+                .iter()
+                .zip(mean_meth.iter())
+                .for_each(|(mod_type, mod_mean)| {
+                    print!("\t{:} = {:}", mod_type, mod_mean);
+                });
+        println!("\n");
         // record
         //     .cigar()
         //     .iter()

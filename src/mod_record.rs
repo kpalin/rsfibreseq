@@ -1,4 +1,6 @@
 use eyre::{OptionExt, Result};
+use itertools::izip;
+use std::fmt::Display;
 use std::{cell::OnceCell, ops::Deref};
 
 use noodles_sam::alignment::record::{
@@ -66,34 +68,100 @@ impl<'a> Deref for ModRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Nucl {
+    A = 0,
+    C = 1,
+    G = 2,
+    T = 3,
+}
+
+impl Display for Nucl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let c = match self {
+            Nucl::A => 'A',
+            Nucl::C => 'C',
+            Nucl::G => 'G',
+            Nucl::T => 'T',
+        };
+        write!(f, "{}", c)
+    }
+}
+
+impl TryFrom<u8> for Nucl {
+    type Error = crate::FibreSeqError;
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            b'A' | b'a' => Ok(Nucl::A),
+            b'C' | b'c' => Ok(Nucl::C),
+            b'T' | b't' => Ok(Nucl::T),
+            b'G' | b'g' => Ok(Nucl::G),
+            _ => Err(crate::FibreSeqError::InvalidCharacter(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModType {
+    pub base: Nucl,
+    pub is_reverse: bool,
+    pub modification: Vec<u8>,
+}
+
+impl Display for ModType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let strand = if self.is_reverse { "-" } else { "+" };
+        write!(
+            f,
+            "{:}{:}{:}",
+            self.base,
+            strand,
+            String::from_utf8(self.modification.clone()).unwrap()
+        )
+    }
+}
+
+impl TryFrom<&[u8]> for ModType {
+    type Error = crate::FibreSeqError;
+    fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
+        let base = Nucl::try_from(value[0])?;
+        let is_reverse = value[1] == b'-';
+        let modification = value[2..].to_vec();
+        Ok(ModType {
+            base,
+            is_reverse,
+            modification,
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ModData {
-    sequence: Vec<u8>,
+    sequence: Vec<Nucl>,
     acgt_pos: OnceCell<[Vec<u32>; 4]>,
     pub probabilities: Vec<Vec<u8>>,
-    pub mod_types: Vec<Vec<u8>>,
+    pub mod_types: Vec<ModType>,
     read_pos: Vec<Vec<u32>>,
     is_reverse: bool,
 }
 
 impl<'a> ModData {
-    fn char_to_idx(c: u8) -> Result<u8> {
-        match c {
-            b'A' | b'a' => Ok(0),
-            b'C' | b'c' => Ok(1),
-            b'T' | b't' => Ok(2),
-            b'G' | b'g' => Ok(3),
-
-            _ => Err(crate::FibreSeqError::InvalidCharacter(c).into()),
-        }
-    }
     fn get_base_positions(&self, base: u8) -> Result<Vec<u32>> {
-        let base = Self::char_to_idx(base)?;
+        let base = Nucl::try_from(base)?;
         let acgt_pos = self.acgt_pos.get_or_init(|| {
             println!(
                 "{:?}bp  {:?}...",
                 self.sequence.len(),
-                String::from_utf8(self.sequence.iter().take(300).copied().collect()).unwrap()
+                String::from_utf8(
+                    self.sequence
+                        .iter()
+                        .take(300)
+                        .copied()
+                        .map(|x| x as u8)
+                        .collect()
+                )
+                .unwrap()
             );
             let mut acgt_pos = [
                 Vec::<u32>::new(), // A
@@ -105,8 +173,7 @@ impl<'a> ModData {
                 .iter()
                 .enumerate()
                 .try_for_each(|(i, c)| -> Result<_> {
-                    let c = Self::char_to_idx(*c)?;
-                    acgt_pos[c as usize].push(i as u32);
+                    acgt_pos[*c as usize].push(i as u32);
                     Ok(())
                 })
                 .unwrap();
@@ -121,17 +188,14 @@ impl<'a> ModData {
         self.mod_types
             .clone()
             .iter()
-            .try_for_each(|x| -> Result<_> {
-                let base_positions = self.get_base_positions(x[0])?;
-                let base_idx = Self::char_to_idx(x[0])?;
-                let probs_count = self.probabilities[base_idx as usize].len();
+            .try_for_each(|m| -> Result<_> {
+                let base_positions = self.get_base_positions(m.base as u8)?;
+
+                let probs_count = self.probabilities[m.base as usize].len();
                 let pos_counts = base_positions.len();
                 println!(
                     "Mod type: {:?} modifications: {:?} bases: {:?} {:?} ",
-                    String::from_utf8(x.clone()),
-                    probs_count,
-                    pos_counts,
-                    self.is_reverse
+                    m, probs_count, pos_counts, self.is_reverse
                 );
                 assert!(probs_count == pos_counts);
 
@@ -157,7 +221,10 @@ impl<'a> ModData {
     ) -> Result<Self> {
         //let mm: Vec<&[u8]> = MM.split(|x| *x == b';').collect();
         //dbg!(mm);
-        let sequence: Vec<u8> = sequence.iter().collect();
+        let sequence: std::result::Result<Vec<_>, _> =
+            sequence.iter().map(Nucl::try_from).collect();
+        let sequence = sequence?;
+
         let mm: Vec<Vec<&[u8]>> = mod_mod
             .split(|x| *x == b';')
             .map(|modstr| -> Vec<&[u8]> { modstr.split(|x| *x == b',').collect() })
@@ -176,11 +243,17 @@ impl<'a> ModData {
 
         let mut base_counts = std::collections::HashMap::new();
         sequence.iter().for_each(|x| {
-            *base_counts.entry(*x as char).or_insert(0) += 1;
+            *base_counts.entry(*x).or_insert(0) += 1;
         });
         println!("{:?}", base_counts);
 
         let mod_types: Vec<Vec<u8>> = mm.iter().map(|x| x[0].to_vec()).collect();
+
+        let mod_types = mm
+            .iter()
+            .map(|x| ModType::try_from(x[0]))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         #[cfg(debug_assertions)]
         {
             steps
@@ -188,10 +261,10 @@ impl<'a> ModData {
                 .zip(mod_types.iter())
                 .for_each(|(mod_steps, mod_type)| {
                     let seq_base_occurences = base_counts
-                        .get(&(mod_type[0] as char))
+                        .get(&(mod_type.base))
                         .ok_or_eyre("No such base found in the sequence")
                         .unwrap();
-                    let mod_type = String::from_utf8(mod_type.clone()).unwrap();
+
                     let mut distinct_step_count = std::collections::HashMap::new();
 
                     mod_steps.iter().for_each(|x| {
@@ -253,6 +326,21 @@ impl<'a> ModData {
             .for_each(|(pos_count, prob_count)| {
                 assert!(pos_count == prob_count);
             });
+
+        for (modt, npos, nprob) in izip!(
+            mod_types.iter(),
+            read_pos.iter().map(|x| x.len()),
+            slices.iter().map(|x| x.len())
+        ) {
+            let nbases = base_counts.get(&modt.base).unwrap();
+            if npos != nprob {
+                panic!("Differing number of steps and probabilities");
+            }
+            if npos > *nbases {
+                panic!("Too many modifications for bases");
+            }
+        }
+
         Ok(Self {
             mod_types,
             read_pos,
