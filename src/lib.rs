@@ -147,19 +147,11 @@ impl App {
             }
         };
 
-        // record.data().iter().for_each(|r| match &r {
-        //     Ok((tag_id, tag_value)) => {
-        //         println!("Found {:?} tag: {:?}", tag_id, tag_value);
-        //     }
-        //     Err(e) => {
-        //         println!("Error reading tag: {:?}", e);
-        //     }
-        // });
-
+        print!("{:} {:?}: ", qname.unwrap(), record.flags().unwrap());
         let mod_data = record.get_modification_data()?;
 
         let mean_meth = &mod_data.mean_methylation(&self.low_cutoff, &self.high_cutoff);
-        print!("{:} {:?}: ", qname.unwrap(), record.flags().unwrap());
+
         let _ =
             &mod_data
                 .mod_types
