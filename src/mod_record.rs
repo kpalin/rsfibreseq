@@ -1,7 +1,8 @@
 use eyre::Result;
 
-use thiserror::Error;
+use serde::{Deserialize, Serialize};
 
+use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum FibreSeqError {
     #[error("Invalid character found from input read '{0}'")]
@@ -77,7 +78,7 @@ impl<'a> Deref for ModRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Nucl {
     A = 0,
@@ -111,7 +112,8 @@ impl TryFrom<u8> for Nucl {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub struct ModType {
     pub base: Nucl,
     pub is_reverse: bool,
@@ -130,7 +132,16 @@ impl Display for ModType {
         )
     }
 }
-
+impl Into<String> for ModType {
+    fn into(self) -> String {
+        format!(
+            "{:}{:}{:}",
+            self.base,
+            if self.is_reverse { "-" } else { "+" },
+            String::from_utf8(self.modification).unwrap()
+        )
+    }
+}
 impl TryFrom<&[u8]> for ModType {
     type Error = FibreSeqError;
     fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
@@ -144,7 +155,13 @@ impl TryFrom<&[u8]> for ModType {
         })
     }
 }
-
+impl TryFrom<String> for ModType {
+    type Error = FibreSeqError;
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        let value = value.as_bytes();
+        ModType::try_from(value)
+    }
+}
 pub struct ModData<'a> {
     record: &'a Box<dyn RecordExt>,
     sequence: OnceCell<Vec<Nucl>>,

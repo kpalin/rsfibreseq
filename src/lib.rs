@@ -4,9 +4,11 @@ use clap::Subcommand;
 
 use eyre::Result;
 use mod_record::Duplex;
-
+use serde_json;
 use std::collections::HashMap;
+use std::fs::write;
 use std::path::PathBuf;
+use std::vec;
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -102,6 +104,7 @@ impl App {
         let mut reader = self.get_reader()?;
         let header = reader.read_header()?;
         let records = reader.records(&header);
+
         let mut hist = HashMap::new();
 
         for (rec_idx, record) in records
@@ -124,17 +127,22 @@ impl App {
                 let likes = mod_data.get_mod_likelihoods(m);
                 for l in likes {
                     hist.entry(m.clone())
-                        .and_modify(|h: &mut [u32; 256]| h[*l as usize] += 1)
+                        .and_modify(|h: &mut Vec<u32>| h[*l as usize] += 1)
                         .or_insert_with(|| {
-                            let mut v = [0u32; 256];
+                            let mut v = vec![0u32; 256];
                             v[*l as usize] = 1;
                             v
                         });
                 }
             }
-            if (rec_idx + 1) % 1000 == 0 {
+            if (rec_idx + 1) % 10000 == 0 {
                 eprintln!("Processed {:} records", rec_idx);
                 dbg!(&hist);
+                // Serialize the HashMap
+                let serialized = serde_json::to_string(&hist).unwrap();
+
+                // Write the serialized HashMap to a file
+                write("path_to_your_file.json", serialized)?;
             }
         }
 
