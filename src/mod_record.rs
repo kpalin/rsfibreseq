@@ -1,18 +1,27 @@
-use eyre::{OptionExt, Result};
-use itertools::izip;
+use eyre::Result;
+
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum FibreSeqError {
+    #[error("Invalid character found from input read '{0}'")]
+    InvalidCharacter(u8),
+    #[error("Error reading record modification skip tag")]
+    MissingMMtag,
+    #[error("Error reading record modification likelihood tag")]
+    MissingMLtag,
+    #[error("Invalid modification annotations")]
+    InvalidModData,
+}
+
+use noodles_sam::alignment::record::{
+    data::field::{value::Array, Tag, Value},
+    Record as RecordExt, Sequence,
+};
 use std::fmt::Display;
 use std::{cell::OnceCell, ops::Deref};
 
-use noodles_sam::alignment::record::{
-    data::field::value::Array,
-    data::field::{Tag, Value},
-    Record as RecordExt,
-};
-
-pub struct ModRecord {
-    record: Box<dyn RecordExt>,
-}
-use noodles_sam::alignment::record::Sequence;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Duplex {
     Duplex,
     Simplex,
@@ -20,6 +29,10 @@ pub enum Duplex {
 }
 
 const DUPLEX_TAG: Tag = Tag::new(b'd', b'x');
+pub struct ModRecord {
+    record: Box<dyn RecordExt>,
+}
+
 impl ModRecord {
     pub fn new(record: Box<dyn RecordExt>) -> Self {
         Self { record }
@@ -28,14 +41,15 @@ impl ModRecord {
         let rec_data = self.record.data();
         let dx_tag = rec_data.get(&DUPLEX_TAG);
         match dx_tag {
-            Some(Ok(Value::Int32(value))) => match value {
-                0 => Duplex::Simplex,
-                1 => Duplex::Duplex,
-                -1 => Duplex::SimplexWithOffspring,
-                _ => panic!("Invalid duplex tag value: {}", value),
+            Some(Ok(value)) => match value.as_int() {
+                Some(0) => Duplex::Simplex,
+                Some(1) => Duplex::Duplex,
+                Some(-1) => Duplex::SimplexWithOffspring,
+                Some(x) => panic!("Invalid duplex tag value: {x:?}"),
+                None => panic!("Invalid duplex tag type {value:?}"),
             },
             None => Duplex::Simplex,
-            Some(_) => panic!("Invalid duplex tag type"),
+            Some(x) => panic!("Invalid duplex tag type {x:?}"),
         }
     }
 
@@ -45,18 +59,13 @@ impl ModRecord {
             rec_data.get(&Tag::BASE_MODIFICATIONS),
             rec_data.get(&Tag::BASE_MODIFICATION_PROBABILITIES),
         ) {
-            (Some(Ok(Value::String(mm))), Some(Ok(Value::Array(ml)))) => {
-                let values = ModData::new(
-                    mm,
-                    &ml,
-                    self.record.flags().unwrap().is_reverse_complemented(),
-                    &self.record.sequence(),
-                );
+            (Some(Ok(Value::String(_mm))), Some(Ok(Value::Array(_ml)))) => {
+                let values = ModData::new(&self.record);
                 values
             }
             (_, _) => return Err(eyre::eyre!("Error reading record")),
         };
-        mod_data
+        Ok(mod_data)
     }
 }
 
@@ -90,14 +99,14 @@ impl Display for Nucl {
 }
 
 impl TryFrom<u8> for Nucl {
-    type Error = crate::FibreSeqError;
-    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+    type Error = FibreSeqError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             b'A' | b'a' => Ok(Nucl::A),
             b'C' | b'c' => Ok(Nucl::C),
             b'T' | b't' => Ok(Nucl::T),
             b'G' | b'g' => Ok(Nucl::G),
-            _ => Err(crate::FibreSeqError::InvalidCharacter(value)),
+            _ => Err(FibreSeqError::InvalidCharacter(value)),
         }
     }
 }
@@ -123,7 +132,7 @@ impl Display for ModType {
 }
 
 impl TryFrom<&[u8]> for ModType {
-    type Error = crate::FibreSeqError;
+    type Error = FibreSeqError;
     fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
         let base = Nucl::try_from(value[0])?;
         let is_reverse = value[1] == b'-';
@@ -136,25 +145,150 @@ impl TryFrom<&[u8]> for ModType {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ModData {
-    sequence: Vec<Nucl>,
+pub struct ModData<'a> {
+    record: &'a Box<dyn RecordExt>,
+    sequence: OnceCell<Vec<Nucl>>,
     acgt_pos: OnceCell<[Vec<u32>; 4]>,
-    pub probabilities: Vec<Vec<u8>>,
-    pub mod_types: Vec<ModType>,
-    read_pos: Vec<Vec<u32>>,
-    is_reverse: bool,
+    //pub probabilities: Vec<Vec<u8>>,
+    mods: OnceCell<Vec<ModType>>,
+    mod_positions: OnceCell<Vec<Vec<u32>>>,
+    mod_likelihoods: OnceCell<Vec<Vec<u8>>>,
 }
 
-impl<'a> ModData {
-    fn get_base_positions(&self, base: u8) -> Result<Vec<u32>> {
-        let base = Nucl::try_from(base)?;
+impl<'a> ModData<'a> {
+    pub fn validate(&self) -> Result<()> {
+        for modt in self.get_modifications().iter() {
+            let mod_pos = self.get_modification_positions(modt)?;
+            let mod_like = self.get_mod_likelihoods(modt);
+            if mod_pos.len() != mod_like.len() {
+                Err(FibreSeqError::InvalidModData)?;
+            }
+            let seq_len = self.get_sequence().len();
+            if *mod_pos.last().ok_or(FibreSeqError::InvalidModData)? > seq_len as u32 {
+                Err(FibreSeqError::InvalidModData)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_mod_likelihoods(&self, modification: &ModType) -> &Vec<u8> {
+        let mod_likes = self.get_all_mod_likelihoods();
+        let mod_idx = modification.base as usize;
+        &mod_likes[mod_idx]
+    }
+    fn get_all_mod_likelihoods(&self) -> &Vec<Vec<u8>> {
+        let mod_likes = self.mod_likelihoods.get_or_init(|| {
+            let rec_data = self.record.data();
+            let mod_like = rec_data
+                .get(&Tag::BASE_MODIFICATION_PROBABILITIES)
+                .ok_or(FibreSeqError::MissingMLtag)
+                .unwrap()
+                .unwrap();
+            let mod_probs: Vec<u8> = match mod_like {
+                Value::Array(Array::UInt8(values)) => {
+                    Ok(values.iter().filter_map(|x| x.ok()).collect())
+                }
+                _ => Err(FibreSeqError::MissingMLtag),
+            }
+            .unwrap();
+
+            let n_sites: Vec<usize> = self
+                .get_modifications()
+                .iter()
+                .map(|m| self.get_modification_positions(m).expect("REASON").len())
+                .collect();
+            let mut start = 0;
+
+            assert_eq!(n_sites.iter().sum::<usize>(), mod_probs.len());
+
+            let probabilities: Vec<Vec<u8>> = n_sites
+                .iter()
+                .map(|&len| {
+                    let slice = &mod_probs[start..start + len].to_vec();
+                    start += len;
+                    slice.to_owned()
+                })
+                .collect();
+
+            probabilities
+        });
+        mod_likes
+    }
+    fn get_mod_and_pos(&self) -> (&Vec<ModType>, &Vec<Vec<u32>>) {
+        if self.mods.get().is_none() || self.mod_positions.get().is_none() {
+            let rec_data = self.record.data();
+            let mod_mod = rec_data
+                .get(&Tag::BASE_MODIFICATIONS)
+                .ok_or(FibreSeqError::MissingMMtag)
+                .unwrap()
+                .unwrap();
+
+            let mm: Result<Vec<Vec<&[u8]>>> = if let Value::String(mod_mod) = mod_mod {
+                Ok(mod_mod
+                    .split(|x| *x == b';')
+                    .map(|modstr| -> Vec<&[u8]> { modstr.split(|x| *x == b',').collect() })
+                    .filter(|z| z.len() > 1)
+                    .collect())
+            } else {
+                Err(FibreSeqError::MissingMMtag.into())
+            };
+            let mm = mm.unwrap();
+            let steps: Vec<Vec<u32>> = mm
+                .iter()
+                .map(|x| {
+                    let mm_values: Vec<u32> = x[1..]
+                        .iter()
+                        .map(|v| str::parse::<u32>(std::str::from_utf8(v).unwrap()).unwrap())
+                        .collect();
+                    mm_values
+                })
+                .collect();
+
+            let read_pos: Vec<Vec<u32>> = steps
+                .iter()
+                .map(|x| {
+                    x.iter()
+                        .scan(0, |sum, &value| {
+                            *sum += value + 1;
+                            Some(*sum - 1)
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let _mod_types: Vec<Vec<u8>> = mm.iter().map(|x| x[0].to_vec()).collect();
+
+            let mod_types = mm
+                .iter()
+                .map(|x| ModType::try_from(x[0]))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+
+            let _ = self.mod_positions.set(read_pos);
+            let _ = self.mods.set(mod_types);
+        };
+        (self.mods.get().unwrap(), self.mod_positions.get().unwrap())
+    }
+    // Get all the positions of the modification in the sequence
+    pub fn get_modification_positions(&self, modification: &ModType) -> Result<&Vec<u32>> {
+        let base_idx = modification.base as usize;
+        let (_, read_pos) = self.get_mod_and_pos();
+
+        Ok(&read_pos[base_idx])
+    }
+
+    pub fn get_modifications(&self) -> &Vec<ModType> {
+        &self.get_mod_and_pos().0
+    }
+    // Get all the positions of the base in the sequence
+    pub fn get_base_positions(&self, base: Nucl) -> &Vec<u32> {
         let acgt_pos = self.acgt_pos.get_or_init(|| {
+            #[cfg(debug_assertions)]
             println!(
                 "{:?}bp  {:?}...",
-                self.sequence.len(),
+                (*self.get_sequence()).len(),
                 String::from_utf8(
-                    self.sequence
+                    self.get_sequence()
                         .iter()
                         .take(300)
                         .copied()
@@ -169,33 +303,33 @@ impl<'a> ModData {
                 Vec::<u32>::new(), // T
                 Vec::<u32>::new(), // G
             ];
-            self.sequence
+            (*self.get_sequence())
                 .iter()
                 .enumerate()
-                .try_for_each(|(i, c)| -> Result<_> {
+                .for_each(|(i, c)| {
                     acgt_pos[*c as usize].push(i as u32);
-                    Ok(())
-                })
-                .unwrap();
+                });
             acgt_pos
         });
 
-        let r = acgt_pos.as_ref()[base as usize].to_vec();
-        Ok(r)
+        &acgt_pos[base as usize]
     }
 
     pub fn assert(self) -> Result<()> {
-        self.mod_types
+        self.get_modifications()
             .clone()
             .iter()
             .try_for_each(|m| -> Result<_> {
-                let base_positions = self.get_base_positions(m.base as u8)?;
+                let base_positions = self.get_base_positions(m.base);
 
-                let probs_count = self.probabilities[m.base as usize].len();
+                let probs_count = self.get_mod_likelihoods(m).len();
                 let pos_counts = base_positions.len();
                 println!(
                     "Mod type: {:?} modifications: {:?} bases: {:?} {:?} ",
-                    m, probs_count, pos_counts, self.is_reverse
+                    m,
+                    probs_count,
+                    pos_counts,
+                    self.record.flags()?.is_reverse_complemented()
                 );
                 assert!(probs_count == pos_counts);
 
@@ -213,158 +347,53 @@ impl<'a> ModData {
                 Ok(())
             })
     }
-    fn new(
-        mod_mod: &[u8],
-        mod_like: &Array,
-        is_reverse: bool,
-        sequence: &dyn Sequence,
-    ) -> Result<Self> {
-        //let mm: Vec<&[u8]> = MM.split(|x| *x == b';').collect();
-        //dbg!(mm);
-        let sequence: std::result::Result<Vec<_>, _> =
-            sequence.iter().map(Nucl::try_from).collect();
-        let sequence = sequence?;
-
-        let mm: Vec<Vec<&[u8]>> = mod_mod
-            .split(|x| *x == b';')
-            .map(|modstr| -> Vec<&[u8]> { modstr.split(|x| *x == b',').collect() })
-            .filter(|z| z.len() > 1)
-            .collect();
-        let steps: Vec<Vec<u32>> = mm
+    fn get_sequence_init(&self) -> Vec<Nucl> {
+        self.record
+            .sequence()
             .iter()
-            .map(|x| {
-                let mm_values: Vec<u32> = x[1..]
-                    .iter()
-                    .map(|v| str::parse::<u32>(std::str::from_utf8(v).unwrap()).unwrap())
-                    .collect();
-                mm_values
-            })
-            .collect();
+            .map(Nucl::try_from)
+            .map(|x| x.unwrap())
+            .collect()
+    }
+    fn get_sequence(&self) -> &Vec<Nucl> {
+        let seq = self.sequence.get_or_init(|| self.get_sequence_init());
 
+        seq
+    }
+    fn check(&self) -> Result<()> {
         let mut base_counts = std::collections::HashMap::new();
-        sequence.iter().for_each(|x| {
+        self.get_sequence().iter().for_each(|x| {
             *base_counts.entry(*x).or_insert(0) += 1;
         });
         println!("{:?}", base_counts);
-
-        let mod_types: Vec<Vec<u8>> = mm.iter().map(|x| x[0].to_vec()).collect();
-
-        let mod_types = mm
-            .iter()
-            .map(|x| ModType::try_from(x[0]))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        #[cfg(debug_assertions)]
-        {
-            steps
-                .iter()
-                .zip(mod_types.iter())
-                .for_each(|(mod_steps, mod_type)| {
-                    let seq_base_occurences = base_counts
-                        .get(&(mod_type.base))
-                        .ok_or_eyre("No such base found in the sequence")
-                        .unwrap();
-
-                    let mut distinct_step_count = std::collections::HashMap::new();
-
-                    mod_steps.iter().for_each(|x| {
-                        *distinct_step_count.entry(x).or_insert(0) += 1;
-                    });
-                    print!("Steps: {:?}", mod_type);
-                    distinct_step_count.iter().for_each(|(k, v)| {
-                        println!("{:?}:{:?} ", k, v);
-                    });
-                    println!(
-                        "Number of steps {:?}, distinct size {:?}, tot.bases {:?} for mod {:?}",
-                        mod_steps.len(),
-                        distinct_step_count.len(),
-                        seq_base_occurences,
-                        mod_type
-                    );
-                    if distinct_step_count.len() == 1 {
-                        assert_eq!(mod_steps.len(), *seq_base_occurences)
-                    } else {
-                        assert!(mod_steps.len() < *seq_base_occurences);
-                    }
-                });
-        }
-
-        let read_pos: Vec<Vec<u32>> = steps
-            .iter()
-            .map(|x| {
-                x.iter()
-                    .scan(0, |sum, &value| {
-                        *sum += value + 1;
-                        Some(*sum - 1)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let n_sites: Vec<usize> = read_pos.iter().map(|x| x.len()).collect();
-
-        let mod_probs: Vec<u8> = match mod_like {
-            Array::UInt8(values) => values.iter().filter_map(|x| x.ok()).collect(),
-            _ => panic!("Error reading ML tag"),
-        };
-
-        let mut start = 0;
-        assert!(n_sites.iter().sum::<usize>() == mod_probs.len());
-        let slices: Vec<Vec<u8>> = n_sites
-            .iter()
-            .map(|&len| {
-                let slice = &mod_probs[start..start + len].to_vec();
-                start += len;
-                slice.to_owned()
-            })
-            .collect();
-
-        read_pos
-            .iter()
-            .map(|x| x.len())
-            .zip(slices.iter().map(|x| x.len()))
-            .for_each(|(pos_count, prob_count)| {
-                assert!(pos_count == prob_count);
-            });
-
-        for (modt, npos, nprob) in izip!(
-            mod_types.iter(),
-            read_pos.iter().map(|x| x.len()),
-            slices.iter().map(|x| x.len())
-        ) {
-            let nbases = base_counts.get(&modt.base).unwrap();
-            if npos != nprob {
-                panic!("Differing number of steps and probabilities");
-            }
-            if npos > *nbases {
-                panic!("Too many modifications for bases");
-            }
-        }
-
-        Ok(Self {
-            mod_types,
-            read_pos,
-            probabilities: slices,
-            sequence,
-            is_reverse,
-            ..Default::default()
-        })
+        Ok(())
     }
 
-    pub fn mean_methylation(&self, low: &u8, high: &u8) -> Vec<f64> {
+    fn new(record: &'a Box<dyn RecordExt>) -> Self {
+        Self {
+            record,
+            sequence: OnceCell::new(),
+            acgt_pos: OnceCell::new(),
+            mods: OnceCell::new(),
+            mod_positions: OnceCell::new(),
+            mod_likelihoods: OnceCell::new(),
+        }
+    }
+
+    pub fn mean_methylation(&self, low: u8, high: u8) -> Result<Vec<f64>> {
         let _total_methylation = 0;
         let _total_sites = 0;
         let mod_freqs = self
-            .mod_types
+            .get_modifications()
             .iter()
-            .zip(self.probabilities.iter())
+            .map(|modt| (modt, self.get_mod_likelihoods(modt)))
             .map(|(_mod_type, mod_probs)| {
                 let (n_sites, n_meth) = mod_probs
                     .iter()
                     .filter_map(|v| {
-                        if *v <= *low {
+                        if *v <= low {
                             Some(0u8)
-                        } else if *v >= *high {
+                        } else if *v >= high {
                             Some(1u8)
                         } else {
                             None
@@ -375,9 +404,9 @@ impl<'a> ModData {
                         acc.1 += x as u32;
                         acc
                     });
-                n_meth as f64 / n_sites as f64
+                Ok(n_meth as f64 / n_sites as f64)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>();
 
         mod_freqs
     }

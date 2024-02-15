@@ -2,15 +2,10 @@ use clap::Parser;
 
 use clap::Subcommand;
 
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum FibreSeqError {
-    #[error("Invalid character found from input read '{0}'")]
-    InvalidCharacter(u8),
-}
 use eyre::Result;
+use mod_record::Duplex;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -23,6 +18,8 @@ struct Cli {
 enum Commands {
     #[command(about = "Check the MM, ML and sequence lengths in input bam")]
     Check(Args),
+    #[command(about = "Make histogram of ML values for each modification")]
+    Hist(Args),
 }
 #[derive(Debug, clap::Args)]
 struct Args {
@@ -90,12 +87,60 @@ impl App {
                 let app = App::new(args);
                 app.check_mods()?
             }
+            Some(Commands::Hist(args)) => {
+                let app = App::new(args);
+                app.calc_histogram()?
+            }
             None => {
                 println!("No subcommand found");
             }
         };
         Ok(())
     }
+
+    pub fn calc_histogram(&self) -> Result<()> {
+        let mut reader = self.get_reader()?;
+        let header = reader.read_header()?;
+        let records = reader.records(&header);
+        let mut hist = HashMap::new();
+
+        for (rec_idx, record) in records
+            .filter(|r| {
+                let r = r.as_ref().unwrap();
+                let flags = r.flags().unwrap();
+                !flags.is_supplementary()
+                    && !flags.is_secondary()
+                    && !flags.is_reverse_complemented()
+            })
+            .map(|r| ModRecord::new(r.unwrap()))
+            .filter(|r| r.is_duplex() != Duplex::Duplex)
+            .enumerate()
+        {
+            //let record = record?;
+            //let record = ModRecord::new(record?);
+
+            let mod_data = record.get_modification_data()?;
+            for m in mod_data.get_modifications() {
+                let likes = mod_data.get_mod_likelihoods(m);
+                for l in likes {
+                    hist.entry(m.clone())
+                        .and_modify(|h: &mut [u32; 256]| h[*l as usize] += 1)
+                        .or_insert_with(|| {
+                            let mut v = [0u32; 256];
+                            v[*l as usize] = 1;
+                            v
+                        });
+                }
+            }
+            if (rec_idx + 1) % 1000 == 0 {
+                eprintln!("Processed {:} records", rec_idx);
+                dbg!(&hist);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn check_mods(&self) -> Result<()> {
         let mut reader = self.get_reader()?;
 
@@ -135,31 +180,23 @@ impl App {
     }
 
     fn process_record(&self, record: &ModRecord) -> Result<()> {
-        let q_name = record.name();
-        let qname = match &q_name {
-            Some(qname) => {
-                let qname = String::from_utf8_lossy(qname.as_bytes());
-
-                Some(qname)
-            }
-            None => {
-                return Err(eyre::eyre!("Error reading record"));
-            }
+        let qname = match record.name() {
+            Some(qname) => String::from_utf8(qname.as_bytes().to_vec())?,
+            None => String::from("No name"),
         };
 
-        print!("{:} {:?}: ", qname.unwrap(), record.flags().unwrap());
+        print!("{:} {:?}: ", qname, record.flags().unwrap());
         let mod_data = record.get_modification_data()?;
+        mod_data.validate().unwrap();
+        let mean_meth = mod_data.mean_methylation(self.low_cutoff, self.high_cutoff);
 
-        let mean_meth = &mod_data.mean_methylation(&self.low_cutoff, &self.high_cutoff);
-
-        let _ =
-            &mod_data
-                .mod_types
-                .iter()
-                .zip(mean_meth.iter())
-                .for_each(|(mod_type, mod_mean)| {
-                    print!("\t{:} = {:}", mod_type, mod_mean);
-                });
+        let _ = &mod_data
+            .get_modifications()
+            .iter()
+            .zip(mean_meth.iter())
+            .for_each(|(mod_type, mod_mean)| {
+                print!("\t{:} = {:?}", mod_type, mod_mean);
+            });
         println!("\n");
         // record
         //     .cigar()
