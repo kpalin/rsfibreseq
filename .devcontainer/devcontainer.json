@@ -1,0 +1,7 @@
+// .devcontainer/devcontainer.json
+{
+  "name": "Rust Dev Container",
+  "image": "mcr.microsoft.com/devcontainers/rust:latest",
+  "features": {}
+
+}
